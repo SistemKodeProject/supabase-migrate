@@ -1,0 +1,18 @@
+# Credentials — JANGAN pernah kecommit
+.env
+
+# Hasil dump SQL & log migrasi (isinya data user, jangan masuk repo)
+migration_output/
+
+# Supabase CLI local state
+.supabase/
+
+# Edge Functions - env lokal per function (kalau ada)
+supabase/functions/**/.env
+
+# Node (kalau install supabase CLI via npm project-local)
+node_modules/
+
+# OS junk
+.DS_Store
+Thumbs.db
