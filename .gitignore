@@ -5,6 +5,9 @@
 migration_output/
 *migration_output/
 
+# Backup file fisik Supabase Storage
+storage_backup_project_a/
+
 # Supabase CLI local state
 .supabase/
 
