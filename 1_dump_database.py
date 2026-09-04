@@ -46,6 +46,12 @@ def dump_auth(src, out_dir):
         [
             "pg_dump", *pg_args(src),
             "--schema=auth", "--data-only",
+            # schema_migrations itu tabel internal buat Supabase Auth service (GoTrue)
+            # sendiri buat nge-track versi migrasinya. Role postgres sengaja dikunci gak
+            # bisa DELETE/INSERT ke tabel ini (permission denied), dan restore data ini
+            # ke TARGET juga gak perlu - versi migrasi TARGET dikelola sendiri oleh
+            # instance Supabase itu, independen dari SOURCE.
+            "--exclude-table-data=auth.schema_migrations",
             "--no-owner", "--no-privileges", "--column-inserts",
             "--format=plain", f"--file={target_file}",
         ],
@@ -63,6 +69,9 @@ def dump_storage(src, out_dir):
         [
             "pg_dump", *pg_args(src),
             "--schema=storage", "--data-only",
+            # storage.migrations sama kayak auth.schema_migrations - tabel internal
+            # buat Supabase Storage service sendiri, postgres gak punya izin tulis ke situ.
+            "--exclude-table-data=storage.migrations",
             "--no-owner", "--no-privileges", "--column-inserts",
             "--format=plain", f"--file={target_file}",
         ],

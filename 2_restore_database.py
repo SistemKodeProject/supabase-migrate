@@ -26,6 +26,45 @@ from common import (
 )
 
 
+CLEAN_SCHEMA_SQL = """
+SET session_replication_role = replica;
+DO $$
+DECLARE r RECORD;
+BEGIN
+  FOR r IN
+    SELECT tablename FROM pg_tables
+    WHERE schemaname = '{schema}'
+      -- schema_migrations itu tabel internal Supabase (GoTrue/Storage service),
+      -- postgres gak punya izin tulis ke situ (permission denied) dan memang
+      -- gak perlu disentuh - versi migrasi dikelola sendiri oleh tiap project.
+      AND tablename NOT IN ('schema_migrations', 'migrations')
+  LOOP
+    EXECUTE format('DELETE FROM %I.%I', '{schema}', r.tablename);
+  END LOOP;
+END $$;
+SET session_replication_role = origin;
+"""
+
+
+def clean_schema(dst, schema):
+    """
+    Hapus semua row di semua tabel pada schema tsb (pakai DELETE + replica mode,
+    BUKAN TRUNCATE, biar gak ke-cascade ke tabel public yang mungkin punya FK
+    ke schema ini - misal auth.users dipakai FK oleh public.quiz_user_progress dll).
+    Ini yang bikin step auth/storage aman dijalanin BERKALI-KALI kapanpun,
+    walau run sebelumnya sempat insert sebagian lalu terputus.
+    """
+    warn(f"Membersihkan data lama di schema '{schema}' (biar gak duplicate key pas re-insert)...")
+    success = run(
+        ["psql", *pg_args(dst), "-v", "ON_ERROR_STOP=1"],
+        env_extra={"PGPASSWORD": dst["password"]},
+        input_text=CLEAN_SCHEMA_SQL.format(schema=schema),
+    )
+    if not success:
+        die(f"Gagal membersihkan schema '{schema}' sebelum restore!")
+    ok(f"Schema '{schema}' sudah bersih, siap di-insert ulang")
+
+
 def require_dump_file(out_dir, filename):
     path = Path(out_dir) / filename
     if not path.exists():
@@ -56,7 +95,7 @@ def restore_schema(dst, out_dir):
     warn("Restoring structure ke TARGET...")
     log_file = f"{out_dir}/log_public_schema_restore.txt"
     success = run(
-        ["psql", *pg_args(dst), "-v", "ON_ERROR_STOP=1", "-f", sql_file],
+        ["psql", *pg_args(dst), "-v", "ON_ERROR_STOP=1", "--single-transaction", "-f", sql_file],
         env_extra={"PGPASSWORD": dst["password"]},
         log_file=log_file,
     )
@@ -72,8 +111,14 @@ def restore_data_only(dst, out_dir, sql_filename, log_filename, label):
     # NB: pakai session_replication_role=replica (bukan --disable-triggers) karena
     # tabel di schema auth/storage dimiliki role supabase_auth_admin/supabase_storage_admin,
     # bukan postgres -> ALTER TABLE DISABLE TRIGGER akan gagal (must be owner of table).
+    # --single-transaction (-1) membungkus semua -c dan -f di atas jadi SATU transaksi
+    # (1x BEGIN di awal, 1x COMMIT di akhir), bukan commit per-statement/per-baris.
+    # Ini krusial buat kecepatan: tanpa ini, tiap baris INSERT = 1 round-trip + 1 commit
+    # terpisah ke server, yang kalau server-nya jauh (misal region lain) jadi SANGAT lambat
+    # untuk file dengan ribuan baris. Efek sampingnya: kalau ada 1 baris gagal, SEMUA baris
+    # di file ini di-rollback (bukan partial) - ini aman & malah lebih bersih untuk di-retry.
     success = run(
-        ["psql", *pg_args(dst), "-v", "ON_ERROR_STOP=1",
+        ["psql", *pg_args(dst), "-v", "ON_ERROR_STOP=1", "--single-transaction",
          "-c", "SET session_replication_role = replica;",
          "-f", sql_file,
          "-c", "SET session_replication_role = origin;"],
@@ -86,16 +131,19 @@ def restore_data_only(dst, out_dir, sql_filename, log_filename, label):
 
 
 def restore_auth(dst, out_dir):
+    clean_schema(dst, "auth")
     restore_data_only(dst, out_dir, "auth_data.sql", "log_auth_restore.txt", "AUTH data")
     warn("Catatan: password hash ikut pindah, user tetep bisa login normal.")
 
 
 def restore_storage_meta(dst, out_dir):
+    clean_schema(dst, "storage")
     restore_data_only(dst, out_dir, "storage_data.sql", "log_storage_restore.txt", "STORAGE metadata")
     warn("Ini cuma metadata. File fisiknya migrasi pakai 3_dump_storage.py + 4_restore_storage.py")
 
 
 def restore_public_data(dst, out_dir):
+    clean_schema(dst, "public")
     restore_data_only(dst, out_dir, "public_data.sql", "log_public_data_restore.txt", "PUBLIC data")
 
 
