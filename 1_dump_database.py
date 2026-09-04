@@ -18,6 +18,7 @@ from pathlib import Path
 from common import (
     header, ok, warn, die, load_env, get_conn, pg_args,
     output_dir, require_binary, run, test_conn, strip_create_schema_public,
+    get_unwritable_tables,
 )
 
 
@@ -42,17 +43,15 @@ def dump_schema(src, out_dir):
 def dump_auth(src, out_dir):
     warn("Dumping AUTH data (users, identities, dll)...")
     target_file = f"{out_dir}/auth_data.sql"
+    skip_tables = get_unwritable_tables(src, "auth")
+    if skip_tables:
+        warn(f"Skip tabel internal auth (gak ada izin INSERT/DELETE): {', '.join(skip_tables)}")
     success = run(
         [
             "pg_dump", *pg_args(src),
             "--schema=auth", "--data-only",
-            # schema_migrations itu tabel internal buat Supabase Auth service (GoTrue)
-            # sendiri buat nge-track versi migrasinya. Role postgres sengaja dikunci gak
-            # bisa DELETE/INSERT ke tabel ini (permission denied), dan restore data ini
-            # ke TARGET juga gak perlu - versi migrasi TARGET dikelola sendiri oleh
-            # instance Supabase itu, independen dari SOURCE.
-            "--exclude-table-data=auth.schema_migrations",
-            "--no-owner", "--no-privileges", "--column-inserts",
+            *[f"--exclude-table-data=auth.{t}" for t in skip_tables],
+            "--no-owner", "--no-privileges",
             "--format=plain", f"--file={target_file}",
         ],
         env_extra={"PGPASSWORD": src["password"]},
@@ -65,14 +64,15 @@ def dump_auth(src, out_dir):
 def dump_storage(src, out_dir):
     warn("Dumping STORAGE metadata (bucket & object index, BUKAN file fisik)...")
     target_file = f"{out_dir}/storage_data.sql"
+    skip_tables = get_unwritable_tables(src, "storage")
+    if skip_tables:
+        warn(f"Skip tabel internal storage (gak ada izin INSERT/DELETE): {', '.join(skip_tables)}")
     success = run(
         [
             "pg_dump", *pg_args(src),
             "--schema=storage", "--data-only",
-            # storage.migrations sama kayak auth.schema_migrations - tabel internal
-            # buat Supabase Storage service sendiri, postgres gak punya izin tulis ke situ.
-            "--exclude-table-data=storage.migrations",
-            "--no-owner", "--no-privileges", "--column-inserts",
+            *[f"--exclude-table-data=storage.{t}" for t in skip_tables],
+            "--no-owner", "--no-privileges",
             "--format=plain", f"--file={target_file}",
         ],
         env_extra={"PGPASSWORD": src["password"]},
@@ -82,7 +82,6 @@ def dump_storage(src, out_dir):
     ok(f"storage_data.sql tersimpan di {target_file}")
     warn("Catatan: ini cuma metadata. File fisiknya migrasi pakai 3_dump_storage.py + 4_restore_storage.py")
 
-
 def dump_public_data(src, out_dir):
     warn("Dumping PUBLIC data (isi semua tabel)...")
     target_file = f"{out_dir}/public_data.sql"
@@ -90,7 +89,7 @@ def dump_public_data(src, out_dir):
         [
             "pg_dump", *pg_args(src),
             "--schema=public", "--data-only",
-            "--no-owner", "--no-privileges", "--column-inserts",
+            "--no-owner", "--no-privileges",
             "--format=plain", f"--file={target_file}",
         ],
         env_extra={"PGPASSWORD": src["password"]},

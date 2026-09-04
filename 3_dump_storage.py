@@ -3,52 +3,71 @@
 STEP 2a: DUMP STORAGE - ambil daftar bucket & konfigurasinya dari project SOURCE.
 Jalanin: python3 3_dump_storage.py
 
-Butuh: requests (pip install requests --break-system-packages)
+Butuh: psql sudah di PATH.
 
-Script ini HANYA baca dari SOURCE lewat Storage API, hasilnya disimpan sebagai
-migration_output/buckets.json. Dipakai oleh 4_restore_storage.py.
+CATATAN: versi ini query langsung ke tabel storage.buckets lewat koneksi
+Postgres (SOURCE_HOST dkk di .env), BUKAN lewat Storage REST API. Ini sengaja
+biar gak kena Storage API egress quota (kalau project SOURCE lagi kena limit
+"exceed_egress_quota", API call ke /storage/v1/bucket bakal ditolak HTTP 402
+walau cuma nge-list doang - koneksi Postgres langsung gak masuk hitungan itu).
 
-Cara ambil credential:
-- SOURCE_PROJECT_REF     : subdomain di URL project, contoh xxxxxxxx.supabase.co -> "xxxxxxxx"
-- SOURCE_SERVICE_ROLE_KEY: Project Settings > API > service_role key
+Hasilnya disimpan sebagai migration_output/buckets.json, format & isinya
+tetap sama kayak versi API lama, jadi kompatibel sama 4_restore_storage.py.
 """
 
 import json
 import sys
 
-from common import header, ok, warn, die, load_env, output_dir
+from common import (
+    header, ok, warn, die, load_env, get_conn, pg_args,
+    output_dir, require_binary, test_conn,
+)
 
-try:
-    import requests
-except ImportError:
-    print("[!] Module 'requests' belum terinstall.")
-    print("    Jalankan: pip install requests --break-system-packages")
-    sys.exit(1)
+import os
+import subprocess
+
+BUCKETS_QUERY = (
+    "SELECT COALESCE(json_agg(row_to_json(b)), '[]'::json) "
+    "FROM (SELECT id, name, public, file_size_limit, allowed_mime_types "
+    "FROM storage.buckets ORDER BY name) b;"
+)
+
+
+def fetch_buckets(src):
+    result = subprocess.run(
+        ["psql", *pg_args(src), "-t", "-A", "-c", BUCKETS_QUERY],
+        env={**os.environ, "PGPASSWORD": src["password"]},
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        die(f"Gagal query storage.buckets dari SOURCE: {result.stderr.strip()}")
+    raw = result.stdout.strip()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        die(f"Gagal parse hasil query jadi JSON. Output mentah:\n{raw}")
 
 
 def main():
+    require_binary("psql", "install: sudo apt install postgresql-client")
+
     load_env()
+    src = get_conn("SOURCE")
     out_dir = output_dir()
 
-    import os
-    src_ref = os.environ.get("SOURCE_PROJECT_REF", "")
-    src_srk = os.environ.get("SOURCE_SERVICE_ROLE_KEY", "")
+    header("SUPABASE DUMP STORAGE (list bucket dari SOURCE, via Postgres langsung)")
 
-    if not src_ref or not src_srk:
-        die("SOURCE_PROJECT_REF / SOURCE_SERVICE_ROLE_KEY belum diisi di .env")
+    test_conn(src, "SOURCE")
 
-    header("SUPABASE DUMP STORAGE (list bucket dari SOURCE)")
+    warn("Mengambil list bucket dari storage.buckets (SOURCE)...")
+    buckets = fetch_buckets(src)
 
-    warn("Mengambil list bucket dari SOURCE...")
-    headers = {"Authorization": f"Bearer {src_srk}", "apikey": src_srk}
-    resp = requests.get(f"https://{src_ref}.supabase.co/storage/v1/bucket", headers=headers)
-
-    if resp.status_code != 200:
-        die(f"Gagal ambil list bucket dari SOURCE: HTTP {resp.status_code} - {resp.text}")
-
-    buckets = resp.json()
-    names = ", ".join(b["name"] for b in buckets)
-    ok(f"Ketemu {len(buckets)} bucket: {names}")
+    if not buckets:
+        warn("Gak ketemu bucket sama sekali di SOURCE - cek lagi kalau ini gak sesuai ekspektasi.")
+    else:
+        names = ", ".join(b["name"] for b in buckets)
+        ok(f"Ketemu {len(buckets)} bucket: {names}")
 
     out_file = f"{out_dir}/buckets.json"
     with open(out_file, "w", encoding="utf-8") as f:

@@ -14,6 +14,7 @@ CLI langsung deploy dari folder supabase/functions/ yang sudah ada di
 komputer lo ke project TARGET.
 """
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -21,6 +22,39 @@ from pathlib import Path
 from common import header, ok, warn, fail, die, load_env, require_binary, run
 
 FUNCTIONS_DIR = "supabase/functions"
+
+
+def list_source_functions(source_ref):
+    """Ambil daftar nama function di SOURCE lewat CLI (format JSON)."""
+    import subprocess
+    result = subprocess.run(
+        ["supabase", "functions", "list", "--project-ref", source_ref, "--output", "json"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        die(f"Gagal list functions dari SOURCE: {result.stderr.strip()}")
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        die(f"Gagal parse output 'supabase functions list' jadi JSON:\n{result.stdout}")
+    # CLI biasanya pakai key "slug", fallback ke "name" kalau beda versi
+    return [fn.get("slug") or fn.get("name") for fn in data]
+
+
+def download_all_functions(source_ref):
+    """Download semua function dari SOURCE ke folder lokal sekali jalan (loop di balik layar)."""
+    warn(f"Folder {FUNCTIONS_DIR} belum ada - ambil daftar function dari SOURCE dulu...")
+    names = list_source_functions(source_ref)
+    if not names:
+        die(f"Gak ketemu function apapun di project SOURCE ({source_ref}).")
+    ok(f"Ketemu {len(names)} function: {', '.join(names)}")
+
+    Path(FUNCTIONS_DIR).mkdir(parents=True, exist_ok=True)
+    for name in names:
+        print(f"      Downloading: {name}...")
+        if not run(["supabase", "functions", "download", name, "--project-ref", source_ref]):
+            die(f"Gagal download function '{name}' dari SOURCE!")
+        ok(f"{name} ter-download")
 
 
 def main():
@@ -33,10 +67,7 @@ def main():
     header("SUPABASE MIGRATE EDGE FUNCTIONS")
 
     if not Path(FUNCTIONS_DIR).is_dir():
-        fail(f"Folder {FUNCTIONS_DIR} gak ketemu.")
-        warn("Kalau belum ada source-nya lokal, tarik dulu per fungsi dari SOURCE:")
-        print(f"      supabase functions download <nama_fn> --project-ref {source_ref}")
-        sys.exit(1)
+        download_all_functions(source_ref)
 
     warn(f"Linking CLI ke project TARGET ({target_ref})...")
     if not run(["supabase", "link", "--project-ref", target_ref]):

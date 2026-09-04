@@ -151,3 +151,40 @@ def strip_create_schema_public(sql_path):
         for line in lines:
             if line.strip() != "CREATE SCHEMA public;":
                 f.write(line)
+
+def query_values(conn, sql):
+    """
+    Jalanin query yang hasilnya 1 kolom, return list of string (baris kosong dibuang).
+    Dipakai buat query "diam-diam" (gak nge-print live output kayak run()),
+    misalnya buat ambil daftar nama tabel yang dipakai internal oleh script.
+    """
+    result = subprocess.run(
+        ["psql", *pg_args(conn), "-t", "-A", "-c", sql],
+        env={**os.environ, "PGPASSWORD": conn["password"]},
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        die(f"Query gagal: {result.stderr.strip()}")
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+UNWRITABLE_TABLES_SQL = """
+SELECT tablename FROM pg_tables
+WHERE schemaname = '{schema}'
+  AND NOT (
+    has_table_privilege(format('%I.%I', schemaname, tablename)::regclass, 'INSERT')
+    AND has_table_privilege(format('%I.%I', schemaname, tablename)::regclass, 'DELETE')
+  );
+"""
+
+
+def get_unwritable_tables(conn, schema):
+    """
+    Cari tabel di suatu schema yang role koneksi ini TIDAK punya izin INSERT/DELETE
+    (biasanya tabel internal service Supabase kayak auth.schema_migrations,
+    storage.buckets_vectors, storage.vector_indexes, dll - daftar ini beda-beda
+    tergantung versi GoTrue/Storage tiap project, makanya dicek dinamis, bukan
+    hardcode nama, biar gak whack-a-mole tiap ada tabel internal baru).
+    """
+    return query_values(conn, UNWRITABLE_TABLES_SQL.format(schema=schema))

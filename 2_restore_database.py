@@ -34,10 +34,11 @@ BEGIN
   FOR r IN
     SELECT tablename FROM pg_tables
     WHERE schemaname = '{schema}'
-      -- schema_migrations itu tabel internal Supabase (GoTrue/Storage service),
-      -- postgres gak punya izin tulis ke situ (permission denied) dan memang
-      -- gak perlu disentuh - versi migrasi dikelola sendiri oleh tiap project.
-      AND tablename NOT IN ('schema_migrations', 'migrations')
+      -- tabel yang kita gak punya izin INSERT/DELETE (tabel internal service
+      -- Supabase kayak schema_migrations, buckets_vectors, vector_indexes, dll)
+      -- di-skip di sini secara dinamis lewat has_table_privilege, BUKAN hardcode
+      -- nama - soalnya daftar tabel internal ini beda-beda tiap versi Supabase.
+      AND has_table_privilege(format('%I.%I', schemaname, tablename)::regclass, 'DELETE')
   LOOP
     EXECUTE format('DELETE FROM %I.%I', '{schema}', r.tablename);
   END LOOP;
@@ -76,6 +77,17 @@ def require_dump_file(out_dir, filename):
     return str(path)
 
 
+RESTORE_SCHEMA_GRANTS_SQL = """
+GRANT USAGE ON SCHEMA public TO postgres, anon, authenticated, service_role;
+GRANT ALL ON ALL TABLES IN SCHEMA public TO postgres, anon, authenticated, service_role;
+GRANT ALL ON ALL ROUTINES IN SCHEMA public TO postgres, anon, authenticated, service_role;
+GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO postgres, anon, authenticated, service_role;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO postgres, anon, authenticated, service_role;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON ROUTINES TO postgres, anon, authenticated, service_role;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO postgres, anon, authenticated, service_role;
+"""
+
+
 def reset_target_schema(dst):
     warn("Reset schema public di TARGET (biar bersih dari sisa run sebelumnya)...")
     warn("PERINGATAN: ini akan MENGHAPUS semua tabel/type/function di schema public TARGET saat ini!")
@@ -87,6 +99,20 @@ def reset_target_schema(dst):
     if not success:
         die("Gagal reset schema public di TARGET!")
     ok("Schema public TARGET sudah bersih")
+
+    # PENTING: CREATE SCHEMA public yang baru itu gak otomatis punya GRANT
+    # ke role anon/authenticated/service_role kayak yang di-setup default sama
+    # Supabase pas provisioning awal project. Kalau ini kelewat, PostgREST bakal
+    # nolak SEMUA query dari app (client-side) dengan "permission denied for
+    # schema public" walau data & tabelnya sendiri udah ke-restore dengan benar.
+    warn("Restore GRANT default Supabase ke schema public (anon/authenticated/service_role)...")
+    success = run(
+        ["psql", *pg_args(dst), "-v", "ON_ERROR_STOP=1", "-c", RESTORE_SCHEMA_GRANTS_SQL],
+        env_extra={"PGPASSWORD": dst["password"]},
+    )
+    if not success:
+        die("Gagal restore GRANT default ke schema public!")
+    ok("GRANT default schema public sudah dipulihkan")
 
 
 def restore_schema(dst, out_dir):
