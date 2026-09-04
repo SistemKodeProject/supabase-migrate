@@ -3,6 +3,7 @@
 
 # Hasil dump SQL & log migrasi (isinya data user, jangan masuk repo)
 migration_output/
+*migration_output/
 
 # Supabase CLI local state
 .supabase/
@@ -12,6 +13,10 @@ supabase/functions/**/.env
 
 # Node (kalau install supabase CLI via npm project-local)
 node_modules/
+
+# Python cache
+__pycache__/
+*.py[cod]
 
 # OS junk
 .DS_Store
