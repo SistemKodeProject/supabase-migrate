@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
@@ -95,12 +96,20 @@ def require_binary(name, hint=""):
 
 
 # ---------- Jalankan command, tampilkan live output, opsional tee ke log file ----------
-def run(cmd, env_extra=None, log_file=None, input_text=None):
+def run(cmd, env_extra=None, log_file=None, input_text=None, quiet=False):
     """
-    Jalankan subprocess, print output secara live, dan (opsional) simpan ke log_file.
+    Jalankan subprocess, print output secara live (kecuali quiet=True), dan
+    (opsional) simpan ke log_file.
     Return True kalau exit code 0, False kalau gagal.
+
+    Selalu nyetel PGCONNECT_TIMEOUT & PGOPTIONS (kalau belum di-set di env)
+    biar koneksi ke Session Pooler lebih tahan banting - beberapa project
+    Supabase punya statement_timeout pendek yang bikin dump tabel gede
+    keputus ("SSL connection has been closed unexpectedly").
     """
     env = os.environ.copy()
+    env.setdefault("PGCONNECT_TIMEOUT", "30")
+    env.setdefault("PGOPTIONS", "-c statement_timeout=0 -c idle_in_transaction_session_timeout=0")
     if env_extra:
         env.update(env_extra)
 
@@ -120,7 +129,8 @@ def run(cmd, env_extra=None, log_file=None, input_text=None):
         proc.stdin.close()
 
     for line in proc.stdout:
-        print(line, end="")
+        if not quiet:
+            print(line, end="")
         lines.append(line)
 
     proc.wait()
@@ -129,7 +139,39 @@ def run(cmd, env_extra=None, log_file=None, input_text=None):
         with open(log_file, "w", encoding="utf-8") as f:
             f.writelines(lines)
 
+    if quiet and proc.returncode != 0:
+        # Kalau quiet tapi gagal, tetep tampilin output-nya biar keliatan errornya.
+        sys.stdout.write("".join(lines))
+
     return proc.returncode == 0
+
+
+# ---------- Jalankan command dengan auto-retry (buat koneksi pooler yang suka putus) ----------
+def run_with_retry(cmd, env_extra=None, log_file=None, input_text=None, quiet=False,
+                    retries=None, backoff=None):
+    """
+    Sama kayak run(), tapi retry otomatis kalau gagal (misal SSL connection
+    closed di tengah dump tabel gede). Jumlah retry & jeda antar-retry bisa
+    di-override lewat env DUMP_RETRIES / DUMP_RETRY_BACKOFF, default 3x
+    dengan jeda 5 detik (bertambah tiap percobaan).
+    """
+    if retries is None:
+        retries = int(os.environ.get("DUMP_RETRIES", "3"))
+    if backoff is None:
+        backoff = int(os.environ.get("DUMP_RETRY_BACKOFF", "5"))
+
+    attempt = 0
+    while True:
+        attempt += 1
+        success = run(cmd, env_extra=env_extra, log_file=log_file,
+                       input_text=input_text, quiet=quiet)
+        if success:
+            return True
+        if attempt >= retries:
+            return False
+        wait_s = backoff * attempt
+        warn(f"Gagal (percobaan {attempt}/{retries}), retry dalam {wait_s}s...")
+        time.sleep(wait_s)
 
 
 def test_conn(conn, label):
@@ -177,6 +219,30 @@ WHERE schemaname = '{schema}'
     AND has_table_privilege(format('%I.%I', schemaname, tablename)::regclass, 'DELETE')
   );
 """
+
+
+def get_public_tables(conn, schema="public"):
+    """
+    Ambil daftar nama base table (bukan view) di suatu schema, terurut nama.
+    Dipakai buat dump data satu-satu per tabel (bukan sekali pg_dump raksasa),
+    supaya kalau satu tabel gede/koneksi putus di tengah, tabel lain tetap
+    kesimpen dan yang gagal gampang di-retry sendiri.
+
+    Tabel milik extension (misal spatial_ref_sys punya postgis) di-skip: isinya
+    udah otomatis dibikin sama CREATE EXTENSION di TARGET, dan owner-nya
+    supabase_admin jadi gak bisa di-insert ulang.
+    """
+    sql = f"""
+    SELECT c.relname FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = '{schema}' AND c.relkind IN ('r', 'p')
+      AND NOT EXISTS (
+        SELECT 1 FROM pg_depend d
+        WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'e'
+      )
+    ORDER BY c.relname;
+    """
+    return query_values(conn, sql)
 
 
 def get_unwritable_tables(conn, schema):

@@ -4,6 +4,8 @@
 # Hasil dump SQL & log migrasi (isinya data user, jangan masuk repo)
 migration_output/
 *migration_output/
+migration_output_project_a/
+*migration_output_project_a/
 
 # Backup file fisik Supabase Storage
 storage_backup_project_a/

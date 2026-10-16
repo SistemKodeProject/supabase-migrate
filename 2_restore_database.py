@@ -17,12 +17,13 @@ jadi auth harus di-restore duluan sebelum public data.
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
 from common import (
-    header, ok, warn, die, load_env, get_conn, pg_args,
-    output_dir, require_binary, run, test_conn,
+    header, ok, warn, fail, die, load_env, get_conn, pg_args,
+    output_dir, require_binary, run, run_with_retry, test_conn, query_values,
 )
 
 
@@ -91,14 +92,27 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO postgres, an
 def reset_target_schema(dst):
     warn("Reset schema public di TARGET (biar bersih dari sisa run sebelumnya)...")
     warn("PERINGATAN: ini akan MENGHAPUS semua tabel/type/function di schema public TARGET saat ini!")
+
+    # DROP SCHEMA public CASCADE ikut nge-drop extension yang di-install di
+    # schema public (misal postgis -> public.geography). Catat dulu, terus
+    # bikin ulang setelah schema dibuat lagi, biar dump yang refer ke
+    # public.geography/public.geometry dll gak error "type does not exist".
+    public_exts = query_values(
+        dst, "SELECT extname FROM pg_extension WHERE extnamespace = 'public'::regnamespace;"
+    )
+    recreate_exts = "".join(
+        f'CREATE EXTENSION IF NOT EXISTS "{ext}" WITH SCHEMA public;' for ext in public_exts
+    )
     success = run(
         ["psql", *pg_args(dst), "-v", "ON_ERROR_STOP=1",
-         "-c", "DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;"],
+         "-c", "DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;" + recreate_exts],
         env_extra={"PGPASSWORD": dst["password"]},
     )
     if not success:
         die("Gagal reset schema public di TARGET!")
     ok("Schema public TARGET sudah bersih")
+    if public_exts:
+        ok(f"Extension di schema public dibuat ulang: {', '.join(public_exts)}")
 
     # PENTING: CREATE SCHEMA public yang baru itu gak otomatis punya GRANT
     # ke role anon/authenticated/service_role kayak yang di-setup default sama
@@ -115,8 +129,69 @@ def reset_target_schema(dst):
     ok("GRANT default schema public sudah dipulihkan")
 
 
+def split_webhook_triggers(sql_file, out_dir):
+    """
+    Pisahin trigger Database Webhook (EXECUTE FUNCTION supabase_functions.http_request)
+    dari dump schema. Schema supabase_functions cuma ada kalau fitur Database
+    Webhooks sudah di-enable di project, jadi di TARGET baru biasanya belum ada
+    -> restore gagal "schema supabase_functions does not exist".
+    Selain itu URL & service_role key di trigger masih nunjuk ke project SOURCE,
+    jadi di-rewrite ke TARGET pakai *_PROJECT_REF & *_SERVICE_ROLE_KEY dari .env.
+    File dump asli gak diubah; hasilnya ditulis ke file terpisah.
+    """
+    replacements = [
+        (os.environ.get("SOURCE_PROJECT_REF", ""), os.environ.get("TARGET_PROJECT_REF", "")),
+        (os.environ.get("SOURCE_SERVICE_ROLE_KEY", ""), os.environ.get("TARGET_SERVICE_ROLE_KEY", "")),
+    ]
+    main_lines, webhook_lines = [], []
+    with open(sql_file, "r", encoding="utf-8") as f:
+        for line in f:
+            if "supabase_functions." in line:
+                for old, new in replacements:
+                    if old and new:
+                        line = line.replace(old, new)
+                webhook_lines.append(line)
+            else:
+                main_lines.append(line)
+
+    main_file = f"{out_dir}/public_schema_no_webhooks.sql"
+    with open(main_file, "w", encoding="utf-8") as f:
+        f.writelines(main_lines)
+    webhook_file = None
+    if webhook_lines:
+        webhook_file = f"{out_dir}/public_webhook_triggers.sql"
+        with open(webhook_file, "w", encoding="utf-8") as f:
+            f.writelines(webhook_lines)
+    return main_file, webhook_file, len(webhook_lines)
+
+
+def restore_webhook_triggers(dst, out_dir, webhook_file, count):
+    has_schema = query_values(
+        dst, "SELECT 1 FROM pg_namespace WHERE nspname = 'supabase_functions';"
+    )
+    if not has_schema:
+        warn(f"{count} trigger Database Webhook DI-SKIP: schema 'supabase_functions' belum ada di TARGET.")
+        warn("      Enable dulu: Dashboard TARGET > Database > Webhooks > Enable webhooks,")
+        warn(f"      lalu jalanin: psql ... -f {webhook_file}")
+        return
+    if not (os.environ.get("TARGET_PROJECT_REF") and os.environ.get("TARGET_SERVICE_ROLE_KEY")):
+        warn("TARGET_PROJECT_REF / TARGET_SERVICE_ROLE_KEY kosong -> URL/key webhook masih nunjuk SOURCE!")
+    warn(f"Restoring {count} trigger Database Webhook...")
+    log_file = f"{out_dir}/log_public_webhook_triggers_restore.txt"
+    success = run(
+        ["psql", *pg_args(dst), "-v", "ON_ERROR_STOP=1", "--single-transaction", "-f", webhook_file],
+        env_extra={"PGPASSWORD": dst["password"]},
+        log_file=log_file,
+    )
+    if not success:
+        fail(f"Gagal restore trigger webhook (struktur lain aman). Cek {log_file}")
+        return
+    ok("Trigger Database Webhook ter-restore")
+
+
 def restore_schema(dst, out_dir):
     sql_file = require_dump_file(out_dir, "public_schema.sql")
+    sql_file, webhook_file, webhook_count = split_webhook_triggers(sql_file, out_dir)
     reset_target_schema(dst)
     warn("Restoring structure ke TARGET...")
     log_file = f"{out_dir}/log_public_schema_restore.txt"
@@ -128,6 +203,8 @@ def restore_schema(dst, out_dir):
     if not success:
         die(f"Gagal restore public schema! Cek {log_file}")
     ok("Struktur public ter-restore")
+    if webhook_file:
+        restore_webhook_triggers(dst, out_dir, webhook_file, webhook_count)
 
 
 def restore_data_only(dst, out_dir, sql_filename, log_filename, label):
@@ -170,7 +247,59 @@ def restore_storage_meta(dst, out_dir):
 
 def restore_public_data(dst, out_dir):
     clean_schema(dst, "public")
-    restore_data_only(dst, out_dir, "public_data.sql", "log_public_data_restore.txt", "PUBLIC data")
+    tables_dir = Path(out_dir) / "public_data_tables"
+    if tables_dir.is_dir() and any(tables_dir.glob("*.sql")):
+        restore_public_data_per_table(dst, out_dir, tables_dir)
+    else:
+        # Fallback: dump lama (versi sebelum per-tabel) cuma punya 1 file gede.
+        restore_data_only(dst, out_dir, "public_data.sql", "log_public_data_restore.txt", "PUBLIC data")
+
+
+def restore_public_data_per_table(dst, out_dir, tables_dir):
+    """
+    Restore public_data_tables/*.sql SATU-SATU (masing-masing --single-transaction
+    sendiri), bukan satu file gede dalam satu transaksi. Alasannya: kalau ada
+    1 tabel yang gagal (misal "relation ... does not exist" karena TARGET
+    belum sinkron sama SOURCE), pendekatan lama bikin SEMUA tabel lain ikut
+    rollback walau sebenernya gak ada masalah. Dengan per-tabel, tabel yang
+    OK tetap ke-restore, dan yang gagal dilaporin jelas biar bisa dibenerin
+    lalu di-retry sendiri tanpa restore ulang semuanya.
+    """
+    warn("Restoring PUBLIC data satu tabel per satu tabel (biar 1 tabel bermasalah gak nge-gagalin semua)...")
+    sql_files = sorted(tables_dir.glob("*.sql"))
+    failed = []
+    for i, sql_file in enumerate(sql_files, 1):
+        table = sql_file.stem
+        print(f"      [{i}/{len(sql_files)}] {table}...", end=" ", flush=True)
+        log_file = Path(out_dir) / f"log_public_data_restore_{table}.txt"
+        success = run_with_retry(
+            ["psql", *pg_args(dst), "-v", "ON_ERROR_STOP=1", "--single-transaction",
+             "-c", "SET session_replication_role = replica;",
+             "-f", str(sql_file),
+             "-c", "SET session_replication_role = origin;"],
+            env_extra={"PGPASSWORD": dst["password"]},
+            log_file=str(log_file),
+            quiet=True,
+        )
+        if success:
+            print("OK")
+            log_file.unlink(missing_ok=True)  # gak perlu nyimpen log kalau sukses
+        else:
+            print("GAGAL")
+            failed.append(table)
+
+    if failed:
+        fail(f"{len(failed)} tabel GAGAL di-restore: {', '.join(failed)}")
+        warn("Kalau errornya 'relation ... does not exist': schema TARGET belum sinkron")
+        warn("sama data yang di-dump (misal ada tabel baru di SOURCE setelah terakhir kali")
+        warn("'--step schema' dijalankan). Fix-nya:")
+        warn("  1. python3 1_dump_database.py --step schema   (dump ulang struktur terbaru)")
+        warn("  2. python3 2_restore_database.py --step schema (aman, ini reset+recreate public)")
+        warn("  3. python3 2_restore_database.py --step data   (retry restore data)")
+        warn(f"Detail error per tabel: {out_dir}/log_public_data_restore_<nama_tabel>.txt")
+        die(f"Restore PUBLIC data selesai SEBAGIAN ({len(sql_files) - len(failed)}/{len(sql_files)} tabel berhasil).")
+
+    ok(f"PUBLIC data ter-restore ({len(sql_files)} tabel)")
 
 
 RESET_SEQ_SQL = """

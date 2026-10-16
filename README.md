@@ -57,6 +57,11 @@ npx supabase login
 ```
 (kalau pakai `npx`, ganti semua panggilan `supabase` di script 5 jadi `npx supabase`)
 
+Kalau project SOURCE dan TARGET ada di **akun Supabase yang beda**, `supabase login`
+saja tidak cukup (token per-akun). Isi `SOURCE_ACCESS_TOKEN` dan `TARGET_ACCESS_TOKEN`
+di `.env` (bikin di https://supabase.com/dashboard/account/tokens, login pakai akun
+pemilik masing-masing project).
+
 ---
 
 # Cara Penggunaan

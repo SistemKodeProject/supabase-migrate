@@ -12,20 +12,21 @@ di OUTPUT_DIR (default ./migration_output), dipakai oleh 2_restore_database.py.
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
 from common import (
-    header, ok, warn, die, load_env, get_conn, pg_args,
-    output_dir, require_binary, run, test_conn, strip_create_schema_public,
-    get_unwritable_tables,
+    header, ok, warn, fail, die, load_env, get_conn, pg_args,
+    output_dir, require_binary, run, run_with_retry, test_conn,
+    strip_create_schema_public, get_unwritable_tables, get_public_tables,
 )
 
 
 def dump_schema(src, out_dir):
     warn("Dumping PUBLIC schema (structure only: tables, RLS policies, functions, triggers)...")
     target_file = f"{out_dir}/public_schema.sql"
-    success = run(
+    success = run_with_retry(
         [
             "pg_dump", *pg_args(src),
             "--schema=public", "--schema-only",
@@ -46,7 +47,7 @@ def dump_auth(src, out_dir):
     skip_tables = get_unwritable_tables(src, "auth")
     if skip_tables:
         warn(f"Skip tabel internal auth (gak ada izin INSERT/DELETE): {', '.join(skip_tables)}")
-    success = run(
+    success = run_with_retry(
         [
             "pg_dump", *pg_args(src),
             "--schema=auth", "--data-only",
@@ -67,7 +68,7 @@ def dump_storage(src, out_dir):
     skip_tables = get_unwritable_tables(src, "storage")
     if skip_tables:
         warn(f"Skip tabel internal storage (gak ada izin INSERT/DELETE): {', '.join(skip_tables)}")
-    success = run(
+    success = run_with_retry(
         [
             "pg_dump", *pg_args(src),
             "--schema=storage", "--data-only",
@@ -83,20 +84,72 @@ def dump_storage(src, out_dir):
     warn("Catatan: ini cuma metadata. File fisiknya migrasi pakai 3_dump_storage.py + 4_restore_storage.py")
 
 def dump_public_data(src, out_dir):
-    warn("Dumping PUBLIC data (isi semua tabel)...")
+    """
+    Dump data schema public SATU TABEL PER SATU TABEL (bukan sekali pg_dump
+    buat semua tabel sekaligus). Alasannya: kalau ada tabel gede (misal
+    log/webhook table) yang bikin koneksi ke Session Pooler putus di tengah
+    ("SSL connection has been closed unexpectedly"), pendekatan lama bikin
+    SELURUH dump gagal dan tabel yang udah kelar ikut hilang. Dengan per-tabel:
+    - tiap tabel gagal otomatis di-retry (lihat run_with_retry / DUMP_RETRIES)
+    - tabel yang berhasil TETAP kesimpen walau ada tabel lain yang gagal
+    - tabel yang mau di-skip total bisa diset di .env: EXCLUDE_DATA_TABLES=a,b,c
+    """
+    warn("Dumping PUBLIC data (isi semua tabel, satu per satu biar tahan gangguan koneksi)...")
     target_file = f"{out_dir}/public_data.sql"
-    success = run(
-        [
-            "pg_dump", *pg_args(src),
-            "--schema=public", "--data-only",
-            "--no-owner", "--no-privileges",
-            "--format=plain", f"--file={target_file}",
-        ],
-        env_extra={"PGPASSWORD": src["password"]},
-    )
-    if not success:
-        die("Gagal dump public data!")
-    ok(f"public_data.sql tersimpan di {target_file}")
+
+    exclude_env = os.environ.get("EXCLUDE_DATA_TABLES", "")
+    excluded = {t.strip() for t in exclude_env.split(",") if t.strip()}
+    if excluded:
+        warn(f"Skip data tabel (dari EXCLUDE_DATA_TABLES di .env): {', '.join(sorted(excluded))}")
+
+    tables = [t for t in get_public_tables(src) if t not in excluded]
+    if not tables:
+        die("Gak ada tabel public buat di-dump (cek EXCLUDE_DATA_TABLES di .env).")
+
+    tables_dir = Path(out_dir) / "public_data_tables"
+    tables_dir.mkdir(parents=True, exist_ok=True)
+    # Bersihin sisa file tabel dari run sebelumnya (misal ada tabel yang udah
+    # dihapus di SOURCE, biar gak ke-restore data basi punya tabel itu).
+    for old_file in tables_dir.glob("*.sql"):
+        old_file.unlink()
+
+    open(target_file, "w", encoding="utf-8").close()  # kosongin/buat file
+
+    failed = []
+    for i, table in enumerate(tables, 1):
+        print(f"      [{i}/{len(tables)}] {table}...", end=" ", flush=True)
+        tmp_file = tables_dir / f"{table}.sql"
+        success = run_with_retry(
+            [
+                "pg_dump", *pg_args(src),
+                "--data-only",
+                f'--table=public."{table}"',
+                "--no-owner", "--no-privileges",
+                "--format=plain", f"--file={tmp_file}",
+            ],
+            env_extra={"PGPASSWORD": src["password"]},
+            quiet=True,
+        )
+        if not success:
+            print("GAGAL")
+            failed.append(table)
+            tmp_file.unlink(missing_ok=True)
+            continue
+        print("OK")
+        with open(tmp_file, "r", encoding="utf-8") as f_in, \
+             open(target_file, "a", encoding="utf-8") as f_out:
+            f_out.write(f_in.read())
+        # NB: tmp_file per-tabel SENGAJA dibiarkan ada di public_data_tables/
+        # (bukan dihapus) - dipakai 2_restore_database.py buat restore per-tabel juga.
+
+    if failed:
+        fail(f"{len(failed)} tabel GAGAL di-dump setelah {os.environ.get('DUMP_RETRIES', '3')}x percobaan: {', '.join(failed)}")
+        warn("Data tabel di atas TIDAK ada di public_data.sql. Opsi:")
+        warn("  1. Jalankan ulang 'python3 1_dump_database.py --step data' (tabel yang udah OK bakal didump ulang juga, gpp)")
+        warn("  2. Kalau tabelnya emang gak penting (misal log/webhook), tambahin ke .env: EXCLUDE_DATA_TABLES=" + ",".join(failed))
+        die("Dump public data selesai SEBAGIAN (ada tabel yang gagal, lihat di atas).")
+
+    ok(f"public_data.sql tersimpan di {target_file} ({len(tables)} tabel)")
 
 
 def main():
