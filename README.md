@@ -155,7 +155,8 @@ python3 3_dump_storage.py
 ```
 
 Ambil daftar bucket & konfigurasinya (public/private, size limit, mime type)
-dari SOURCE lewat Storage API, simpan ke `migration_output/buckets.json`.
+dari SOURCE lewat query langsung ke tabel `storage.buckets` (koneksi Postgres,
+bukan Storage API, biar gak kena egress quota), simpan ke `migration_output/buckets.json`.
 
 ### 2b. Restore bucket + sync file ke TARGET
 
@@ -184,6 +185,38 @@ python3 4_restore_storage.py --skip-sync
 ```
 
 > Proses sync bisa lama tergantung total ukuran file di storage.
+
+### 2c. (Opsional) Download file storage ke lokal
+
+Kalau mau punya backup file fisik storage di komputer sendiri (bukan sync
+ke TARGET), pakai:
+
+```bash
+python3 6_download_storage.py --dry-run   # simulasi dulu, liat file apa aja yang bakal ke-download
+python3 6_download_storage.py             # download semua bucket dari SOURCE
+```
+
+Script ini **read-only ke Supabase** — cuma list bucket + download object
+via `rclone copy` (protokol S3), gak ada upload/hapus/ubah apapun di project.
+File lokal yang udah ada juga gak dihapus. Cuma butuh credential
+`SOURCE_S3_*` (atau `TARGET_S3_*` kalau pakai `--from TARGET`) di `.env`.
+
+Hasilnya tersimpan di `./storage_backup/<project_ref>/<nama_bucket>/...`,
+strukturnya persis kayak di bucket. Folder ini sudah di-`.gitignore`.
+
+Opsi lain:
+```bash
+python3 6_download_storage.py --from TARGET          # download dari project TARGET
+python3 6_download_storage.py --only Audio images    # cuma bucket tertentu
+python3 6_download_storage.py --dest ~/backup_saya   # folder tujuan custom
+```
+
+Kalau download sempat terputus, jalankan ulang saja — file yang sudah
+ke-download otomatis di-skip. Bucket yang gagal ditampilkan di akhir
+beserta command retry-nya.
+
+> Download lewat S3 tetap dihitung sebagai egress. Kalau project lagi kena
+> `exceed_egress_quota`, download kemungkinan besar ikut ditolak.
 
 ---
 
@@ -239,6 +272,7 @@ project/
 ├── 3_dump_storage.py             # list bucket SOURCE -> buckets.json
 ├── 4_restore_storage.py          # buckets.json -> recreate bucket + rclone sync
 ├── 5_migrate_edge_functions.py   # deploy edge functions ke TARGET
+├── 6_download_storage.py         # (opsional) download file storage -> lokal
 ├── .env
 ├── .env.example
 ├── supabase/
@@ -250,6 +284,8 @@ project/
 │   ├── public_data.sql
 │   ├── buckets.json
 │   └── log_*.txt
+├── storage_backup/               # hasil 6_download_storage.py
+│   └── <project_ref>/<nama_bucket>/...
 └── README.md
 ```
 
