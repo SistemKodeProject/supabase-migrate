@@ -19,7 +19,6 @@ komputer lo ke project TARGET.
 
 import json
 import os
-import sys
 from pathlib import Path
 
 from common import header, ok, warn, fail, die, load_env, require_binary, run
@@ -103,7 +102,7 @@ def main():
     warn("Supabase Management API gak pernah expose VALUE dari secrets,")
     warn("jadi ini gak bisa diotomatisasi. Nama secret di SOURCE:")
     run(["supabase", "secrets", "list", "--project-ref", source_ref], env_extra=cli_env("SOURCE"))
-    print(f"\n      Set ulang manual satu-satu ke TARGET pakai:")
+    print("\n      Set ulang manual satu-satu ke TARGET pakai:")
     print(f"      supabase secrets set NAMA_SECRET=nilai --project-ref {target_ref}")
 
     header("EDGE FUNCTIONS MIGRATION SELESAI!")

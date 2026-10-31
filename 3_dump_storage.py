@@ -16,7 +16,6 @@ tetap sama kayak versi API lama, jadi kompatibel sama 4_restore_storage.py.
 """
 
 import json
-import sys
 
 from common import (
     header, ok, warn, die, load_env, get_conn, pg_args,
