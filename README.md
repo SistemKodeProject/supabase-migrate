@@ -1,352 +1,219 @@
-# Supabase Migration (Linux / Python)
+# Supabase Migration Tools
 
-Migrasi full project Supabase (database, storage, edge functions) ke project
-Supabase baru. Ini adalah port Linux/Python dari versi PowerShell, dengan
-database dipecah jadi 2 script terpisah (dump & restore) supaya kalau salah
-satu tahap restore gagal, tinggal jalankan ulang restore-nya aja tanpa perlu
-dump ulang dari SOURCE.
+Move a whole Supabase project (database, auth users, storage buckets and files,
+edge functions) to another Supabase project, with plain Python scripts you can
+run step by step and re-run safely when something fails halfway.
 
----
+[Bahasa Indonesia](README.id.md)
 
-## Prerequisites
+## Why this exists
 
-### 1. PostgreSQL client tools (`pg_dump` & `psql`)
+Supabase has no built-in "clone this project" button, and the official
+guides leave several gaps once your project is real-world sized:
 
-```bash
-sudo apt update
-sudo apt install postgresql-client
-```
+- **IPv6-only direct connections.** `db.<ref>.supabase.co` no longer
+  resolves on many home and office networks. These scripts use the Session
+  Pooler endpoint, which has IPv4.
+- **Dumps that die halfway.** Pooler connections and short
+  `statement_timeout`s cut off large `pg_dump`s. Data is dumped **per table**
+  with automatic retry and backoff, so one broken table never costs you the
+  whole dump.
+- **Dump and restore are separate.** If a restore step fails, fix the cause
+  and re-run only that step. You never have to dump SOURCE again.
+- **Supabase-internal tables.** Tables you cannot write to (for example
+  `auth.schema_migrations`) are detected dynamically rather than hardcoded,
+  so the scripts keep working as GoTrue and Storage change.
+- **Egress quota locks.** Bucket metadata is read via Postgres instead of the
+  Storage API, and storage files are synced S3 to S3 with `rclone`. There is
+  also a path for pushing a local backup when SOURCE is locked by
+  `exceed_egress_quota`.
+- **Cross-account migrations.** Edge functions deploy with separate access
+  tokens for SOURCE and TARGET.
 
-Verifikasi:
-```bash
-pg_dump --version
-psql --version
-```
+## What gets migrated
 
-### 2. Python package `requests` (dipakai untuk panggil Storage API)
+| Component | How | Script |
+|---|---|---|
+| `public` schema (tables, RLS policies) | `pg_dump` schema-only | `1_dump_database.py` / `2_restore_database.py` |
+| `auth` data (users, identities) | `pg_dump` data-only | same |
+| `storage` metadata (buckets, object index) | `pg_dump` data-only | same |
+| `public` data | per-table `pg_dump` with retry | same |
+| Sequences | reset after restore | `2_restore_database.py --step sequences` |
+| Storage buckets config | Postgres query, saved as `buckets.json` | `3_dump_storage.py` / `4_restore_storage.py` |
+| Storage files | `rclone sync` S3 to S3 | `4_restore_storage.py` |
+| Edge functions | Supabase CLI deploy | `5_migrate_edge_functions.py` |
 
-```bash
-pip install requests --break-system-packages
-```
+Not migrated automatically (set these in the new project's dashboard):
+edge function **secret values**, auth provider OAuth credentials, custom SMTP,
+custom domains.
 
-### 3. `rclone` (untuk migrasi Storage - file fisik)
+## Requirements
 
-Download dari [rclone.org/downloads](https://rclone.org/downloads), extract, lalu:
+- Python 3.10+ and `pip install -r requirements.txt` (only `requests`)
+- PostgreSQL client tools: `pg_dump`, `psql`
+  (`sudo apt install postgresql-client` on Debian/Ubuntu, `brew install libpq` on macOS)
+- [`rclone`](https://rclone.org/downloads) for storage files
+- [Supabase CLI](https://supabase.com/docs/guides/cli) for edge functions
 
-```bash
-sudo cp rclone /usr/local/bin/
-sudo chmod +x /usr/local/bin/rclone
-```
+Tested on Linux and macOS. A PowerShell variant for Windows is maintained
+separately.
 
-Verifikasi:
-```bash
-rclone --version
-```
-
-### 4. Supabase CLI (untuk migrasi Edge Functions)
-
-```bash
-npm install -g supabase
-supabase login
-```
-
-Kalau `npm install -g` tidak didukung di versi CLI terbaru, install per-project:
-```bash
-npm install -D supabase
-npx supabase login
-```
-(kalau pakai `npx`, ganti semua panggilan `supabase` di script 5 jadi `npx supabase`)
-
-Kalau project SOURCE dan TARGET ada di **akun Supabase yang beda**, `supabase login`
-saja tidak cukup (token per-akun). Isi `SOURCE_ACCESS_TOKEN` dan `TARGET_ACCESS_TOKEN`
-di `.env` (bikin di https://supabase.com/dashboard/account/tokens, login pakai akun
-pemilik masing-masing project).
-
----
-
-# Cara Penggunaan
-
-## Step 0 — Siapkan Konfigurasi
-
-Copy `.env.example` jadi `.env`, lalu isi semua value:
+## Quick start
 
 ```bash
-cp .env.example .env
-nano .env
+git clone https://github.com/SistemKodeProject/supabase-migrate
+cd supabase-migrate
+pip install -r requirements.txt
+cp .env.example .env    # fill in SOURCE_* and TARGET_*
 ```
 
-| Variabel | Ambil dari |
+Where each value comes from:
+
+| Variable | Dashboard location |
 |---|---|
-| `SOURCE_HOST` / `TARGET_HOST` | Project Settings → Database → **Connect** → tab **Session pooler** (contoh: `aws-0-ap-southeast-1.pooler.supabase.com`) |
-| `SOURCE_USER` / `TARGET_USER` | Sama seperti di tab Session pooler, formatnya `postgres.<project_ref>` (**bukan** cuma `postgres`) |
-| `SOURCE_PORT` / `TARGET_PORT` | Biasanya tetap `5432` (session pooler) |
-| `SOURCE_PROJECT_REF` / `TARGET_PROJECT_REF` | Subdomain di URL project (`xxxxxxxx.supabase.co`) |
-| `SOURCE_SERVICE_ROLE_KEY` / `TARGET_SERVICE_ROLE_KEY` | Project Settings → API |
-| `SOURCE_S3_ACCESS_KEY` / `SECRET` / `ENDPOINT` | Project Settings → Storage → S3 Connection → New access key |
+| `*_HOST`, `*_USER`, `*_PORT` | Project Settings > Database > Connect > **Session pooler** tab. User is `postgres.<project_ref>`, not just `postgres`. |
+| `*_PROJECT_REF` | the subdomain in `https://<ref>.supabase.co` |
+| `*_SERVICE_ROLE_KEY` | Project Settings > API |
+| `*_S3_ACCESS_KEY`, `*_S3_SECRET_KEY`, `*_S3_ENDPOINT` | Project Settings > Storage > S3 Connection > New access key |
+| `*_ACCESS_TOKEN` | https://supabase.com/dashboard/account/tokens (per account) |
 
-> **Kenapa pakai Session Pooler, bukan direct connection (`db.xxxxx.supabase.co`)?**
-> Direct connection sekarang **IPv6-only**. Kalau jaringan/ISP kamu belum support IPv6
-> dengan baik (umum terjadi di ISP rumahan Indonesia, WiFi kantor, dll), koneksi akan
-> gagal dengan error seperti `could not translate host name`. Session Pooler (Supavisor)
-> punya endpoint IPv4 sehingga jalan di jaringan mana pun.
-
----
-
-## Step 1 — Migrasi Database (dump lalu restore, 2 script terpisah)
-
-### 1a. Dump dari SOURCE
+Then run the steps in order. Every script can also be run directly
+(`python3 1_dump_database.py`); `migrate.py` just saves typing.
 
 ```bash
-python3 1_dump_database.py
+python3 migrate.py dump-db            # 1. SOURCE -> migration_output/*.sql   (read-only on SOURCE)
+python3 migrate.py restore-db         # 2. migration_output/*.sql -> TARGET   (resets public schema on TARGET)
+python3 migrate.py dump-storage       # 3. SOURCE bucket config -> buckets.json
+python3 migrate.py restore-storage    # 4. recreate buckets + rclone sync S3 -> S3
+python3 migrate.py functions          # 5. deploy supabase/functions/ to TARGET
 ```
 
-Script ini **hanya baca dari SOURCE**, aman dijalankan berkali-kali. Otomatis:
-1. Test koneksi ke SOURCE
-2. Dump struktur tabel + RLS policies (`public_schema.sql`)
-3. Dump data `auth` (users, identities) → `auth_data.sql`
-4. Dump metadata `storage` (bucket & object index, bukan file fisik) → `storage_data.sql`
-5. Dump data `public` (isi semua tabel) → `public_data.sql`
+## Step details
 
-Semua file tersimpan di `migration_output/` (path dari `OUTPUT_DIR` di `.env`).
-
-Kalau cuma mau dump ulang satu bagian (misal dump public data doang):
-```bash
-python3 1_dump_database.py --step data
-```
-Pilihan: `schema`, `auth`, `storage`, `data`, `all` (default `all`).
-
-### 1b. Restore ke TARGET
+### 1. Dump database (SOURCE only)
 
 ```bash
-python3 2_restore_database.py
+python3 1_dump_database.py [--step schema|auth|storage|data|all]
 ```
 
-Script ini **membaca file dari `migration_output/`** (hasil step 1a) dan restore
-ke TARGET. Tidak menyentuh SOURCE sama sekali. Otomatis:
-1. Test koneksi ke TARGET
-2. Reset schema `public` di TARGET (drop + create ulang, biar bersih)
-3. Restore struktur tabel + RLS policies
-4. Restore data `auth`
-5. Restore metadata `storage`
-6. Restore data `public`
-7. Reset sequence/auto-increment
+Writes `public_schema.sql`, `auth_data.sql`, `storage_data.sql` and
+`public_data.sql` to `OUTPUT_DIR` (default `./migration_output`). Safe to
+run repeatedly. `--step data` re-dumps only the public table data.
 
-**Kalau salah satu tahap gagal** (misal restore public data gagal karena ada
-constraint aneh), kamu **tidak perlu dump ulang**. Benerin dulu masalahnya,
-lalu jalankan ulang cuma tahap yang gagal:
+Tuning in `.env`: `EXCLUDE_DATA_TABLES` to skip big log tables,
+`DUMP_RETRIES` and `DUMP_RETRY_BACKOFF` for flaky connections.
+
+### 2. Restore database (TARGET only)
 
 ```bash
-python3 2_restore_database.py --step data
+python3 2_restore_database.py [--step schema|auth|storage|data|sequences|all]
 ```
-Pilihan: `schema`, `auth`, `storage`, `data`, `sequences`, `all` (default `all`).
 
-> Urutan `all` penting: `schema → auth → storage → data → sequences`, karena
-> foreign key di `public.*` menunjuk ke `auth.users`, jadi `auth` harus
-> ter-restore duluan sebelum `data` (public).
+Order matters: `schema -> auth -> storage -> data -> sequences`, because
+`public.*` foreign keys point at `auth.users`. **`--step schema` drops and
+recreates the `public` schema on TARGET.** If a step fails, read
+`migration_output/log_*.txt`, fix the cause, and re-run only that step.
 
----
-
-## Step 2 — Migrasi Storage (File Fisik, dump lalu restore, 2 script terpisah)
-
-### 2a. Dump list bucket dari SOURCE
+### 3. Dump storage buckets (SOURCE only)
 
 ```bash
 python3 3_dump_storage.py
 ```
 
-Ambil daftar bucket & konfigurasinya (public/private, size limit, mime type)
-dari SOURCE lewat query langsung ke tabel `storage.buckets` (koneksi Postgres,
-bukan Storage API, biar gak kena egress quota), simpan ke `migration_output/buckets.json`.
+Reads `storage.buckets` through Postgres (not the Storage REST API, which
+returns HTTP 402 when the project is over its egress quota) and writes
+`migration_output/buckets.json`.
 
-### 2b. Restore bucket + sync file ke TARGET
-
-```bash
-python3 4_restore_storage.py
-```
-
-Baca `buckets.json`, lalu:
-1. Recreate bucket di TARGET (skip kalau sudah ada, tidak dihapus/ditimpa)
-2. Sync semua file pakai `rclone` (protokol S3), **langsung dari SOURCE ke TARGET**
-
-> **Catatan penting**: beda dengan database, file fisik storage **tidak
-> didump ke lokal** — `rclone sync` jalan real-time dari S3 SOURCE ke S3
-> TARGET, jadi script restore ini tetap butuh credential S3 SOURCE *dan*
-> TARGET (keduanya sudah ada di `.env`).
-
-Kalau proses sync sempat terputus (misal koneksi putus di tengah bucket besar),
-jalankan ulang saja — `rclone sync` otomatis skip file yang sudah sama:
-```bash
-python3 4_restore_storage.py --only nama_bucket_yang_gagal
-```
-
-Kalau cuma mau recreate bucket tanpa sync file dulu:
-```bash
-python3 4_restore_storage.py --skip-sync
-```
-
-> Proses sync bisa lama tergantung total ukuran file di storage.
-
-### 2c. (Opsional) Download file storage ke lokal
-
-Kalau mau punya backup file fisik storage di komputer sendiri (bukan sync
-ke TARGET), pakai:
+### 4. Restore buckets and sync files
 
 ```bash
-python3 6_download_storage.py --dry-run   # simulasi dulu, liat file apa aja yang bakal ke-download
-python3 6_download_storage.py             # download semua bucket dari SOURCE
+python3 4_restore_storage.py [--only BUCKET] [--skip-sync]
 ```
 
-Script ini **read-only ke Supabase** — cuma list bucket + download object
-via `rclone copy` (protokol S3), gak ada upload/hapus/ubah apapun di project.
-File lokal yang udah ada juga gak dihapus. Cuma butuh credential
-`SOURCE_S3_*` (atau `TARGET_S3_*` kalau pakai `--from TARGET`) di `.env`.
+Recreates each bucket on TARGET (existing buckets are left untouched), then
+`rclone sync`s files directly from SOURCE S3 to TARGET S3. Interrupted? Run it
+again with `--only <bucket>`; rclone skips files that already match.
 
-Hasilnya tersimpan di `./storage_backup/<project_ref>/<nama_bucket>/...`,
-strukturnya persis kayak di bucket. Folder ini sudah di-`.gitignore`.
+### 5. Edge functions
 
-Opsi lain:
-```bash
-python3 6_download_storage.py --from TARGET          # download dari project TARGET
-python3 6_download_storage.py --only Audio images    # cuma bucket tertentu
-python3 6_download_storage.py --dest ~/backup_saya   # folder tujuan custom
-```
-
-Kalau download sempat terputus, jalankan ulang saja — file yang sudah
-ke-download otomatis di-skip. Bucket yang gagal ditampilkan di akhir
-beserta command retry-nya.
-
-> Download lewat S3 tetap dihitung sebagai egress. Kalau project lagi kena
-> `exceed_egress_quota`, download kemungkinan besar ikut ditolak.
-
----
-
-## Step 3 — Migrasi Edge Functions
-
-Pastikan folder `supabase/functions/` sudah berisi source code function kamu.
-Kalau belum ada lokal, tarik dulu dari project lama:
-
-```bash
-supabase functions download <nama_fn> --project-ref <SOURCE_PROJECT_REF>
-```
-
-Jalankan:
 ```bash
 python3 5_migrate_edge_functions.py
 ```
 
-Script ini otomatis:
-1. Link CLI ke project TARGET
-2. Deploy semua function yang ada di `supabase/functions/`
-3. Tampilkan daftar nama secrets di SOURCE (value-nya **harus diinput manual**,
-   Supabase tidak pernah expose value secret lewat API)
-
-Set ulang secrets:
-```bash
-supabase secrets set NAMA_SECRET=nilai --project-ref <TARGET_PROJECT_REF>
-```
-
-> Script ini **tidak dipecah** dump/restore seperti database & storage,
-> karena sifatnya beda — tidak ada "dump" file lokal untuk source code
-> function; CLI langsung deploy dari folder lokal yang sudah ada di
-> komputer kamu ke project TARGET.
-
----
-
-## Yang TIDAK Ter-cover Otomatis
-
-Cek & set manual di dashboard project baru:
-- Value dari Edge Function secrets
-- Auth Provider config (Google/GitHub OAuth client ID & secret)
-- Custom SMTP config
-- Custom domain
-
----
-
-## Struktur Project
-
-```text
-project/
-├── common.py                     # helper bersama (jangan dijalankan langsung)
-├── 1_dump_database.py            # dump SOURCE -> file lokal
-├── 2_restore_database.py         # file lokal -> restore ke TARGET
-├── 3_dump_storage.py             # list bucket SOURCE -> buckets.json
-├── 4_restore_storage.py          # buckets.json -> recreate bucket + rclone sync
-├── 5_migrate_edge_functions.py   # deploy edge functions ke TARGET
-├── 6_download_storage.py         # (opsional) download file storage -> lokal
-├── .env
-├── .env.example
-├── supabase/
-│   └── functions/
-├── migration_output/
-│   ├── public_schema.sql
-│   ├── auth_data.sql
-│   ├── storage_data.sql
-│   ├── public_data.sql
-│   ├── buckets.json
-│   └── log_*.txt
-├── storage_backup/               # hasil 6_download_storage.py
-│   └── <project_ref>/<nama_bucket>/...
-└── README.md
-```
-
----
-
-## Troubleshooting
-
-### `pg_dump: command not found` / `psql: command not found`
+Downloads functions from SOURCE if `supabase/functions/` is empty, links the
+CLI to TARGET, deploys every function, and lists the secret **names** on
+SOURCE. Secret values are never exposed by Supabase, so set them manually:
 
 ```bash
-sudo apt update && sudo apt install postgresql-client
+supabase secrets set NAME=value --project-ref <TARGET_PROJECT_REF>
 ```
 
-### `rclone: command not found`
-
-Pastikan binary hasil extract `rclone` sudah di `/usr/local/bin/` atau
-folder lain yang ada di `$PATH`.
-
-### `ModuleNotFoundError: No module named 'requests'`
+### Optional: local storage backup
 
 ```bash
-pip install requests --break-system-packages
+python3 6_download_storage.py [--from SOURCE|TARGET] [--dest DIR] [--only BUCKET ...] [--dry-run]
 ```
 
-### Gagal Konek ke SOURCE/TARGET (`could not translate host name`)
+Read-only. Downloads every object to `./storage_backup/<project_ref>/<bucket>/...`
+with `rclone copy`. Re-run to resume.
 
-Ini biasanya bukan salah ketik, tapi karena `.env` masih pakai direct
-connection (`db.xxxxx.supabase.co`) yang sekarang IPv6-only. Cek dulu:
+### Optional: push a local backup to TARGET
 
 ```bash
-getent hosts db.xxxxx.supabase.co
+cp folder_map.example.json folder_map.json   # describe your folder -> bucket layout
+python3 push_local_backup.py /path/to/backup [--map folder_map.json] [--dry-run]
 ```
 
-Kalau host tidak resolve atau koneksi tetap gagal, ganti `SOURCE_HOST`/`TARGET_HOST`
-di `.env` ke **Session pooler** endpoint (lihat Step 0 di atas), dan pastikan
-`SOURCE_USER`/`TARGET_USER` juga diubah ke format `postgres.<project_ref>`.
+For when SOURCE is quota-locked but you have the files locally. Needs only
+`TARGET_*` credentials.
 
-### Restore Gagal Karena Foreign Key ke `auth.users`
+## Verifying the result
 
-Pastikan urutan tidak diacak — jalankan `2_restore_database.py` tanpa
-`--step` (default `all`) supaya `auth` di-restore sebelum `data` (public).
-Kalau masih gagal, cek `log_public_data_restore.txt` di `migration_output/`.
-
-### Bucket Sudah Ada di Target Tapi File Kosong
-
-Bucket yang sudah ada akan di-skip pembuatannya (tidak dihapus/ditimpa),
-tapi `rclone sync` tetap jalan mengisi file-nya. Jalankan ulang
-`4_restore_storage.py` kalau proses sync sempat terputus.
-
-### Verifikasi Hasil Migrasi
-
-Masuk ke database target (pakai Session pooler juga):
 ```bash
-psql -h <TARGET_HOST> -p <TARGET_PORT> -U <TARGET_USER> -d <TARGET_DB>
+psql -h <TARGET_HOST> -p 5432 -U postgres.<TARGET_REF> -d postgres
 ```
 
-Lalu:
 ```sql
 SELECT COUNT(*) FROM auth.users;
 SELECT COUNT(*) FROM storage.objects;
 \dt public.*
 ```
 
-Bandingkan angkanya dengan project lama — harus sama.
+Compare the counts with SOURCE.
+
+## Troubleshooting
+
+**`could not translate host name`**: you are using the direct connection
+host. Switch `*_HOST` to the Session Pooler endpoint and `*_USER` to
+`postgres.<project_ref>`.
+
+**`SSL connection has been closed unexpectedly` during dump**: a pooler
+timeout on a big table. The per-table dump retries automatically; raise
+`DUMP_RETRIES` or exclude the table with `EXCLUDE_DATA_TABLES` if it keeps
+failing.
+
+**Foreign key errors on restore**: run `2_restore_database.py` without
+`--step` so `auth` is restored before `data`.
+
+**HTTP 402 from the Storage API**: SOURCE is over its egress quota. Step 3
+already avoids the API; for files use `push_local_backup.py` with a backup
+you made earlier.
+
+**`rclone: command not found`**: put the extracted binary in `/usr/local/bin`.
+
+## Safety notes
+
+- Dump scripts only read from SOURCE. Restore scripts only write to TARGET.
+- `migration_output/` contains `auth.users` with password hashes. It is
+  git-ignored; treat it as a production backup and delete it when done.
+- Rotate the keys and tokens you used after the migration. See
+  [SECURITY.md](SECURITY.md).
+
+## Contributing
+
+Issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
+Test against throwaway projects only.
+
+## License
+
+[MIT](LICENSE)

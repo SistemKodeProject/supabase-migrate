@@ -1,0 +1,11 @@
+{
+  "folders": [
+    { "local": "audio",   "bucket": "Audio",  "path": "audio" },
+    { "local": "lessons", "bucket": "images", "path": "Lessons" },
+    { "local": "misc",    "bucket": "other",  "path": "" }
+  ],
+  "root_files": {
+    "bucket": "other",
+    "files": ["logo.png", "cover.jpg"]
+  }
+}

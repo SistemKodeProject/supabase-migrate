@@ -1,31 +1,34 @@
-# Credentials — JANGAN pernah kecommit
+# Credentials - never commit
 .env
+.env.*
+!.env.example
 
-# Hasil dump SQL & log migrasi (isinya data user, jangan masuk repo)
+# Dump output and migration logs (contain user data)
 migration_output/
-*migration_output/
-migration_output_project_a/
-*migration_output_project_a/
-migration_output_project_b/
-*migration_output_project_b/
+migration_output_*/
 
-# Backup file fisik Supabase Storage
-storage_backup_project_a/
+# Local Supabase Storage backups
 storage_backup/
+storage_backup_*/
+
+# Per-project folder mapping for push_local_backup.py
+folder_map.json
 
 # Supabase CLI local state
 .supabase/
-
-# Edge Functions - env lokal per function (kalau ada)
 supabase/functions/**/.env
 
-# Node (kalau install supabase CLI via npm project-local)
+# Node (if the Supabase CLI is installed per-project)
 node_modules/
 
-# Python cache
+# Python
 __pycache__/
 *.py[cod]
+.venv/
+.ruff_cache/
 
-# OS junk
+# OS / editor
 .DS_Store
 Thumbs.db
+.vscode/
+.idea/

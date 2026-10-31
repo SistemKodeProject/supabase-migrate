@@ -9,47 +9,58 @@ Cuma butuh kredensial TARGET (gak nyentuh SOURCE sama sekali):
 - TARGET_PROJECT_REF / TARGET_SERVICE_ROLE_KEY
 - TARGET_S3_ACCESS_KEY / SECRET_KEY / ENDPOINT
 
-MAPPING folder lokal -> bucket TARGET (hasil crosscheck manual ke storage.objects,
-sesuaikan FOLDER_MAP di bawah kalau strukturnya beda):
+The local folder -> bucket mapping is read from folder_map.json (see
+folder_map.example.json). Nothing about your project layout is hardcoded.
 """
 
 import argparse
+import json
 import os
-import subprocess
-import sys
 import tempfile
 
 from common import header, ok, warn, fail, die, load_env, require_binary, run
 
-# (folder_relatif_di_backup, nama_bucket_target, path_tujuan_di_dalam_bucket)
-# path_tujuan "" artinya taruh persis di root bucket (bukan di subfolder)
-FOLDER_MAP = [
-    ("audio_set_a",        "Audio", "audio_set_a"),
-    ("audio_set_b",     "Audio", "audio_set_b"),
-    ("audio_set_c",       "Audio", "audio_set_c"),
-    ("audio_set_d",          "Audio", "audio_set_d"),
-    ("audio_set_e",          "Audio", "audio_set_e"),
-    ("audio_set_f",          "Audio", "audio_set_f"),
-    ("audio_set_g",          "Audio", "audio_set_g"),
-    ("audio_set_h",          "Audio", "audio_set_h"),
-    ("audio_set_i",         "Audio", "audio_set_i"),
-    ("lesson_audio",      "images", "lesson_audio"),
-    ("Lessons",         "images", "Lessons"),
-    ("Quiz",            "images", "Quiz"),
-    ("quiz_media",      "images", "quiz_media"),
-    ("image",           "other", "image"),
-    ("voice",           "other", "voice"),
-]
+FOLDER_MAP_FILE = "folder_map.json"
 
-# File lepas di ROOT backup (bukan di dalam folder) yang masuk bucket covers
-ROOT_FILES_TO_COVERS = [
-    "file_1.png",
-    "file_2.png",
-    "file_3.jpg",
-    "file_4.jpg",
-    "file_5.jpg",
-    "file_6.jpg",
-]
+
+def load_folder_map(path=FOLDER_MAP_FILE):
+    """
+    Load the local-folder -> bucket mapping from a JSON file.
+
+    Every project lays out its storage differently, so the mapping is NOT
+    hardcoded. Copy folder_map.example.json to folder_map.json and edit it.
+
+    Format:
+    {
+      "folders": [
+        {"local": "audio",  "bucket": "Audio",  "path": "audio"},
+        {"local": "covers", "bucket": "images", "path": ""}
+      ],
+      "root_files": {"bucket": "misc", "files": ["logo.png"]}
+    }
+
+    "path" is the destination prefix inside the bucket ("" = bucket root).
+    "root_files" is optional: loose files in the backup root that belong in
+    one bucket.
+    """
+    if not os.path.isfile(path):
+        die(f"{path} not found. Copy folder_map.example.json to {path} and edit it for your project.")
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    folders = []
+    for item in data.get("folders", []):
+        try:
+            folders.append((item["local"], item["bucket"], item.get("path", "")))
+        except (KeyError, TypeError):
+            die(f"Invalid entry in {path}: {item!r} (need 'local' and 'bucket')")
+
+    root = data.get("root_files") or {}
+    root_bucket = root.get("bucket")
+    root_files = root.get("files", [])
+    if root_files and not root_bucket:
+        die(f"'root_files' in {path} lists files but no 'bucket'")
+    return folders, root_bucket, root_files
 
 
 def write_rclone_config(akey, skey, endpt):
@@ -107,6 +118,7 @@ def main():
     parser = argparse.ArgumentParser(description="Push backup lokal storage -> TARGET (bypass SOURCE)")
     parser.add_argument("backup_root", help="Path folder root hasil backup lokal")
     parser.add_argument("--dry-run", action="store_true", help="Simulasi doang, gak beneran upload")
+    parser.add_argument("--map", default=FOLDER_MAP_FILE, help=f"Path to the folder mapping JSON (default {FOLDER_MAP_FILE})")
     args = parser.parse_args()
 
     require_binary("rclone", "download dari https://rclone.org/downloads")
@@ -126,17 +138,21 @@ def main():
     if args.dry_run:
         warn("MODE DRY-RUN - gak ada file yang beneran ke-upload, cuma simulasi.")
 
+    folder_map, root_bucket, root_files = load_folder_map(args.map)
+    ok(f"Loaded {len(folder_map)} folder mapping(s) from {args.map}")
+
     rclone_conf = write_rclone_config(dst_akey, dst_skey, dst_endpt)
     ok(f"rclone config dibuat di {rclone_conf}")
 
-    for local_folder, bucket, remote_path in FOLDER_MAP:
+    for local_folder, bucket, remote_path in folder_map:
         push_folder(args.backup_root, local_folder, bucket, remote_path, rclone_conf, args.dry_run)
 
-    push_root_files(args.backup_root, ROOT_FILES_TO_COVERS, "covers", rclone_conf, args.dry_run)
+    if root_files:
+        push_root_files(args.backup_root, root_files, root_bucket, rclone_conf, args.dry_run)
 
     print()
     header("SELESAI")
-    ok("Semua folder di FOLDER_MAP udah diproses. Cek output di atas buat yang SKIP/FAIL.")
+    ok("Semua folder di folder_map.json udah diproses. Cek output di atas buat yang SKIP/FAIL.")
     if args.dry_run:
         warn("Ini masih dry-run — jalanin ulang tanpa --dry-run buat beneran push.")
 

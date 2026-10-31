@@ -18,7 +18,6 @@ jadi auth harus di-restore duluan sebelum public data.
 
 import argparse
 import os
-import sys
 from pathlib import Path
 
 from common import (

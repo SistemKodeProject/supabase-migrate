@@ -13,12 +13,11 @@ di OUTPUT_DIR (default ./migration_output), dipakai oleh 2_restore_database.py.
 
 import argparse
 import os
-import sys
 from pathlib import Path
 
 from common import (
     header, ok, warn, fail, die, load_env, get_conn, pg_args,
-    output_dir, require_binary, run, run_with_retry, test_conn,
+    output_dir, require_binary, run_with_retry, test_conn,
     strip_create_schema_public, get_unwritable_tables, get_public_tables,
 )
 
@@ -180,7 +179,7 @@ def main():
     }
 
     if args.step == "all":
-        for name, fn in steps.items():
+        for _name, fn in steps.items():
             print(f"\n{'-'*56}")
             fn(src, out_dir)
     else:
