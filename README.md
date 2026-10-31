@@ -8,8 +8,18 @@ run step by step and re-run safely when something fails halfway.
 
 ## Why this exists
 
-Supabase has no built-in "clone this project" button, and the official
-guides leave several gaps once your project is real-world sized:
+Supabase offers two official paths and both leave gaps:
+
+- **Project transfer** moves a project between organizations, but only to an
+  organization you are already a member of, never across regions, and it
+  moves rather than copies. Handing a project to a client's own account, or
+  cloning production into a staging project, is not covered.
+- **The backup/restore guide** is a manual sequence of `supabase db dump`,
+  `psql`, a Node script for storage and CLI commands for functions. It does
+  not cover `auth.users`, and when a step fails halfway you start over.
+
+These scripts automate the second path and fix the failure modes we hit on
+real projects:
 
 - **IPv6-only direct connections.** `db.<ref>.supabase.co` no longer
   resolves on many home and office networks. These scripts use the Session
@@ -20,6 +30,8 @@ guides leave several gaps once your project is real-world sized:
   whole dump.
 - **Dump and restore are separate.** If a restore step fails, fix the cause
   and re-run only that step. You never have to dump SOURCE again.
+- **Auth users included.** `auth.users` and `auth.identities` are dumped and
+  restored before public data, so foreign keys to users keep working.
 - **Supabase-internal tables.** Tables you cannot write to (for example
   `auth.schema_migrations`) are detected dynamically rather than hardcoded,
   so the scripts keep working as GoTrue and Storage change.
@@ -45,7 +57,8 @@ guides leave several gaps once your project is real-world sized:
 
 Not migrated automatically (set these in the new project's dashboard):
 edge function **secret values**, auth provider OAuth credentials, custom SMTP,
-custom domains.
+custom domains, Vault root key (see the official guide), custom Postgres
+roles and non-default extensions.
 
 ## Requirements
 
